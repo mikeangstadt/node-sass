@@ -1,9 +1,14 @@
-var fs = require('fs'),
-    path = require('path'),
-    spawn = require('child_process').spawn,
+/*!
+ * node-sass: scripts/build.js
+ */
+
+var eol = require('os').EOL,
+    pkg = require('../package.json'),
+    fs = require('fs'),
     mkdir = require('mkdirp'),
-    Mocha = require('mocha');
-    
+    path = require('path'),
+    spawn = require('child_process').spawn;
+
 require('../lib/extensions');
 
 /**
@@ -14,32 +19,74 @@ require('../lib/extensions');
  */
 
 function afterBuild(options) {
-  var folder = options.debug ? 'Debug' : 'Release';
-  var target = path.join(__dirname, '..', 'build', folder, 'binding.node');
-  var install = path.join(__dirname, '..', 'vendor', process.sassBinaryName, 'binding.node');
+  var install = process.sass.binaryPath;
+  var target = path.join(__dirname, '..', 'build', options.debug ? 'Debug' : 'Release', 'binding.node');
 
-  mkdir(path.join(__dirname, '..', 'vendor', process.sassBinaryName), function (err) {
+  mkdir(path.dirname(install), function(err) {
     if (err && err.code !== 'EEXIST') {
       console.error(err.message);
       return;
     }
 
-    fs.stat(target, function (err) {
+    fs.stat(target, function(err) {
       if (err) {
         console.error('Build succeeded but target not found');
         return;
       }
 
-      fs.rename(target, install, function (err) {
+      fs.rename(target, install, function(err) {
         if (err) {
           console.error(err.message);
           return;
         }
 
-        console.log('Installed in `' + install + '`');
+        console.log('Installed in `', install, '`');
       });
     });
   });
+}
+
+/**
+ * initSubmodules
+ *
+ * @param {Function} cb
+ * @api private
+ */
+
+function initSubmodules(cb) {
+  var errorMsg = '';
+  var git = spawn(['LIBSASS_GIT_VERSION=', pkg.libsass, ' ./scripts/git.sh'].join(''));
+  git.stderr.on('data', function(data) {
+    errorMsg += data.toString();
+  });
+  git.on('close', function(code) {
+    var error;
+    if (code !== 0) {
+      error = { message: errorMsg + 'Unable to checkout the libSass submodule' };
+    }
+    cb(error);
+  });
+}
+
+/**
+ * installGitDependencies
+ *
+ * @param {Function} cb
+ * @api private
+ */
+
+function installGitDependencies(cb) {
+  var libsassPath = './src/libsass';
+
+  if (fs.access) { // node 0.12+, iojs 1.0.0+
+    fs.access(libsassPath, fs.R_OK, function(err) {
+      err && err.code === 'ENOENT' ? initSubmodules(cb) : cb();
+    });
+  } else { // node < 0.12
+    fs.exists(libsassPath, function(exists) {
+      exists ? cb() : initSubmodules(cb);
+    });
+  }
 }
 
 /**
@@ -50,26 +97,33 @@ function afterBuild(options) {
  */
 
 function build(options) {
-  var proc = spawn(process.execPath, ['node_modules/pangyp/bin/node-gyp', 'rebuild'].concat(options.args), {
-    stdio: [0, 1, 2]
-  });
+  installGitDependencies(function(err) {
+    if (err) {
+      console.error(err.message);
+      process.exit(1);
+    }
 
-  proc.on('exit', function(code) {
-    if (code) {
-      if (code === 127) {
-        console.error([
-          'node-gyp not found! Please upgrade your install of npm!',
-          'You need at least 1.1.5 (I think) and preferably 1.1.30.'
-        ].join(' '));
+    var args = [path.join('node_modules', 'pangyp', 'bin', 'node-gyp'), 'rebuild'].concat(
+      ['libsass_ext', 'libsass_cflags', 'libsass_ldflags', 'libsass_library'].map(function(subject) {
+        return ['--', subject, '=', process.env[subject.toUpperCase()] || ''].join('');
+      })).concat(options.args);
+
+    console.log(['Building:', process.sass.runtime.execPath].concat(args).join(' '));
+
+    var proc = spawn(process.sass.runtime.execPath, args, {
+      stdio: [0, 1, 2]
+    });
+
+    proc.on('exit', function(errorCode) {
+      if (!errorCode) {
+        afterBuild(options);
 
         return;
       }
 
-      console.error('Build failed');
-      return;
-    }
-
-    afterBuild(options);
+      console.error(errorCode === 127 ? 'node-gyp not found!' : 'Build failed');
+      process.exit(1);
+    });
   });
 }
 
@@ -114,34 +168,25 @@ function testBinary(options) {
     return build(options);
   }
 
-  fs.stat(path.join(__dirname, '..', 'vendor', process.sassBinaryName, 'binding.node'), function (err) {
-    if (err) {
-      return build(options);
-    }
+  try {
+    process.sass.getBinaryPath(true);
+  } catch (e) {
+    return build(options);
+  }
 
-    console.log('`' + process.sassBinaryName + '` exists; testing');
+  console.log('`', process.sass.binaryPath, '` exists.', eol, 'testing binary.');
 
-    var mocha = new Mocha({
-      ui: 'bdd',
-      timeout: 999999,
-      reporter: function() {}
+  try {
+    require('../').renderSync({
+      data: 's { a: ss }'
     });
 
-    mocha.addFile(path.resolve(__dirname, '..', 'test', 'api.js'));
-    mocha.grep(/should compile sass to css with file/).run(function (done) {
-      if (done !== 0) {
-        console.log([
-          'Problem with the binary.',
-          'Manual build incoming.',
-          'Please consider contributing the release binary to https://github.com/sass/node-sass-binaries for npm distribution.'
-        ].join('\n'));
+    console.log('Binary is fine; exiting.');
+  } catch (e) {
+    console.log(['Problem with the binary.', 'Manual build incoming.'].join(eol));
 
-        return build(options);
-      }
-
-      console.log('Binary is fine; exiting');
-    });
-  });
+    return build(options);
+  }
 }
 
 /**
